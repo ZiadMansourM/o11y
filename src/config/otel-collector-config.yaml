@@ -1,0 +1,218 @@
+extensions:
+  basicauth/server:
+    htpasswd:
+      # To configure the extension as a server authenticator, either one of htpasswd.file 
+      # or htpasswd.inline has to be set. If both are configured, htpasswd.inline credentials 
+      # take precedence.
+      # file: .htpasswd
+      inline: |
+        ${env:BASIC_AUTH_USERNAME}:${env:BASIC_AUTH_PASSWORD}
+  
+  basicauth/client:
+    client_auth: 
+      username: otel-lgtm-client
+      password: neBdKnUD0beRkWJqjDYj7U6Fphig3C2VYcGI6RE9uDmXnBLTxKsYqu2xwt8oADlJ
+
+  zpages:
+    endpoint: otel-collector:55679
+  health_check:
+  # pprof:
+  
+  # file_storage/otc:
+  #   directory: /var/lib/storage/otc
+  #   timeout: 10s
+
+receivers:
+  filelog:
+    include:
+    # - /log.log
+    - /var/lib/docker/containers/*/*-json.log
+    include_file_path: true
+    include_file_name: false
+    start_at: beginning
+    multiline:
+      line_start_pattern: '^\{'
+    # operators:
+    # - id: parse-log-message
+    #   type: json_parser
+    #   parse_from: log
+    # - id: re-labelling
+    #   type: metadata
+    #   resource:
+    #     service.name: EXPR($$.attrs.tag)
+    #     # log.level: EXPR($$.log_level)
+    #     # log.timestamp: EXPR($$.log_ts)
+    #     stream: EXPR($$.stream)
+
+  otlp:
+    protocols:
+      grpc:
+        endpoint: otel-collector:4317
+        # auth:
+        #   authenticator: basicauth/server
+      http:
+        endpoint: otel-collector:4318
+        # auth:
+        #   authenticator: basicauth/server
+
+  hostmetrics:
+    scrapers:
+      cpu:
+      disk:
+      filesystem:
+      load:
+      memory:
+      network:
+      process:
+      processes:
+      paging:
+
+  prometheus:
+    config:
+      global:
+        scrape_interval: 15s
+        scrape_timeout: 10s
+      scrape_configs:
+      - job_name: 'otel-collector'
+        static_configs:
+        - targets: ['otel-collector:8888']
+      - job_name: 'loki'
+        static_configs:
+        - targets: ['loki:3100']
+      - job_name: 'mimir'
+        static_configs:
+        - targets: ["mimir:8080"]
+      - job_name: 'minio'
+        bearer_token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwcm9tZXRoZXVzIiwic3ViIjoieDYyaEFGRWI0d2tSTlJhUiIsImV4cCI6NDg5MzI5MjA2OX0.4lbnJidTEDSx61v0CmFtFkX8-23QO7wiTVdpt9OQX792oFRwDssEEE1dgffh26mVw1BYz88UAFEYZcqF4M8fSA
+        metrics_path: /minio/v2/metrics/cluster
+        scheme: http
+        static_configs:
+        - targets: ['minio:9000']
+
+processors:
+  attributes/source-type-attr:
+    actions:
+    - action: insert
+      key: source
+      value: docker
+
+  resource/source-type-attr:
+    # actions: insert, update, upsert, delete, hash, extract, convert.
+    attributes:
+    - key: source.type
+      value: docker
+      action: upsert
+  
+  resource/source-location-attr:
+    # actions: insert, update, upsert, delete, hash, extract, convert.
+    attributes:
+    - key: source.location
+      value: ziad-mac
+      action: upsert
+
+  batch:
+    # send_batch_size: 1000
+    # timeout: 10s
+
+  transform/add-service-name:
+    flatten_data: true
+    error_mode: ignore
+    log_statements:
+    - context: log
+      statements:
+      - set(attributes["log.record.original"], body)
+      - merge_maps(cache, ParseJSON(body), "upsert")
+      - set(resource.attributes["service.name"], cache["attrs"]["tag"])
+      - set(body, cache["log"])
+      - set(attributes["log.iostream"], cache["stream"])
+      - set(attributes["timestamp"], cache["time"])
+      - set(time_unix_nano, Int(cache["time"]))
+
+exporters:
+  debug:
+    verbosity: detailed
+    # sampling_initial: 5
+    # sampling_thereafter: 200
+
+  # File Exporter: ingest logs to local file
+  # Ref: https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/fileexporter
+  # file:
+  #   path: ./app42_example.log
+  #   rotation:
+
+  otlphttp/logs:
+    endpoint: http://loki:3100/otlp
+    # auth:
+    #   authenticator: basicauth/client
+    tls:
+      insecure: true
+
+  otlp/traces:
+    endpoint: tempo:4317
+    # auth:
+    #   authenticator: basicauth/client
+    tls:
+      insecure: true
+    # sending_queue:
+    #   storage: file_storage/otc
+
+  otlphttp/metrics:
+    endpoint: http://mimir:8080/otlp
+    # auth:
+    #   authenticator: basicauth/client
+    tls:
+      insecure: true
+  
+  prometheusremotewrite:
+    endpoint: http://mimir:8080/api/v1/push
+    tls:
+      insecure: true
+    # headers:
+    #   X-Scope-OrgID: demo
+
+
+service:
+  extensions: [zpages, health_check]
+  # extensions: [basicauth/server, basicauth/client]
+  # extensions: [zpages, health_check, file_storage]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/traces]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/logs]
+    logs/filelog:
+      receivers: [filelog]
+      processors: [resource/source-type-attr, resource/source-location-attr, transform/add-service-name]
+      exporters: [otlphttp/logs]
+      # exporters: [debug]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [batch]
+      exporters: [otlphttp/metrics]
+    # metrics/hostmetrics:
+    #   receivers: [hostmetrics]
+    #   processors: [resource/source-location-attr]
+    #   exporters: [otlphttp/metrics]
+      # exporters: [debug]
+
+  telemetry:
+    metrics:
+      readers:
+      - pull:
+          exporter:
+            prometheus:
+              host: 'otel-collector'
+              port: 8888
+    logs:
+      # level: debug
+      processors:
+      - batch:
+          exporter:
+            otlp:
+              protocol: http/protobuf
+              endpoint: http://otel-collector:4318

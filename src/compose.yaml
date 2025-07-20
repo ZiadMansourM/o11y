@@ -1,0 +1,228 @@
+name: lgtm
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      tag: '{{ index .Config.Labels "com.docker.compose.project" }}/{{ index .Config.Labels "com.docker.compose.service" }}'
+
+services:
+  # -----------------------------------------------------
+  # MinIO (Object Storage)
+  # -----------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/minio'
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+    - ./volumes/minio-data:/data
+    ports:
+    - 9000:9000
+    - 9001:9001
+    command: server /data --console-address :9001
+
+  # -----------------------------------------------------
+  # Create buckets for Loki, Tempo, Mimir
+  # -----------------------------------------------------
+  create_bucket:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/create-bucket'
+    depends_on:
+    - minio
+    entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      until mc alias set myminio http://minio:9000 "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}"; do
+        echo "Waiting for MinIO..."
+        sleep 2
+      done;
+      mc mb --ignore-existing myminio/loki;
+      mc anonymous set public myminio/loki;
+      mc mb --ignore-existing myminio/tempo;
+      mc anonymous set public myminio/tempo;
+      mc mb --ignore-existing myminio/mimir;
+      mc anonymous set public myminio/mimir;
+      exit 0;
+    env_file: .env
+    volumes:
+    - ./volumes/minio-data:/data
+
+  # -----------------------------------------------------
+  # Mimir (Prometheus-compatible metrics backend)
+  # -----------------------------------------------------
+  mimir:
+    image: grafana/mimir:2.15.0
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/mimir'
+    command: ["-config.file=/etc/mimir.yaml"]
+    hostname: mimir
+    # We do NOT define a healthcheck here because the image lacks curl/wget
+    ports:
+    - 9009:9009   # Metrics endpoint
+    - 8080:8080   # HTTP/ready
+    depends_on:
+      create_bucket:
+        condition: service_completed_successfully
+    volumes:
+    - ./config/mimir.yaml:/etc/mimir.yaml
+    - ./volumes/mimir-data:/data
+  
+  # -----------------------------------------------------
+  # Separate sidecar container to health-check Mimir
+  # -----------------------------------------------------
+  mimir-healthcheck:
+    image: busybox:1.37.0
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/mimir-healthcheck'
+    depends_on:
+    - mimir
+    # - mimir-1
+    # - mimir-2
+    # - mimir-3
+    entrypoint: 
+    - /bin/sh
+    - -c
+    - |
+      echo "Waiting for Mimir to be ready...";
+      until wget --quiet --tries=1 --output-document=- http://mimir:8080/ready; do
+        echo "Mimir is not ready yet, retrying in 5 seconds...";
+        sleep 5;
+      done;
+      echo "Mimir is ready!";
+      exit 0;
+
+  # -----------------------------------------------------
+  # Loki (Log aggregation)
+  # -----------------------------------------------------
+  loki:
+    image: grafana/loki:3.3.2
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/loki'
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: wget --quiet --tries=1 --output-document=- http://loki:3100/ready
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      create_bucket:
+        condition: service_completed_successfully
+    environment:
+    - LOKI_PORT=3100
+    volumes:
+    - ./config/loki-config.yaml:/etc/loki/local-config.yaml
+    - ./volumes/loki-data:/loki
+    ports:
+    - 3100:3100
+
+  # -----------------------------------------------------
+  # Tempo (Tracing backend)
+  # -----------------------------------------------------
+  tempo:
+    image: grafana/tempo:2.7.0
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/tempo'
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    healthcheck:
+      test: wget --quiet --tries=1 --output-document=- http://tempo:3200/ready
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      create_bucket:
+        condition: service_completed_successfully
+    volumes:
+    - ./config/tempo.yaml:/etc/tempo.yaml
+    - ./volumes/tempo-data:/var/tempo
+    post_start:
+    - command: chown -R 10001:10001 /var/tempo
+      user: root
+    ports:
+    - 3200 # Tempo
+    - 4320:4317 # OTLP gRPC
+    - 4321:4318 # OTLP HTTP
+
+  # -----------------------------------------------------
+  # OpenTelemetry Collector
+  # -----------------------------------------------------
+  otel-collector:
+    # image: otel/opentelemetry-collector:0.80.0
+    image: otel/opentelemetry-collector-contrib:0.118.0
+    user: "0"
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/otel-collector'
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml", "--feature-gates=transform.flatten.logs"]
+    volumes:
+    - ./config/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    # - ./test/log.log:/log.log
+    depends_on:
+      tempo:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      mimir-healthcheck:
+        condition: service_completed_successfully
+    ports:
+    - 4317:4317   # For gRPC
+    - 4318:4318   # For HTTP
+    - 55679:55679 # ZPages
+    - 24224:24224 # Fluentd
+
+    # Links:
+    # http://127.0.0.1:55679/debug/servicez
+    # http://127.0.0.1:55679/debug/pipelinez
+    # http://127.0.0.1:55679/debug/extensionz
+    # http://127.0.0.1:55679/debug/featurez
+    # http://127.0.0.1:55679/debug/tracez
+    # http://127.0.0.1:55679/debug/rpcz
+
+  # -----------------------------------------------------
+  # Grafana (UI)
+  # -----------------------------------------------------
+  grafana:
+    image: grafana/grafana-oss:11.4.0-ubuntu
+    # image: grafana/grafana-oss:12.0.2-ubuntu
+    logging:
+      driver: json-file
+      options:
+        tag: 'lgtm/grafana'
+    restart: unless-stopped
+    environment:
+    - GF_SECURITY_ADMIN_USER=admin
+    - GF_SECURITY_ADMIN_PASSWORD=testing321
+    ports:
+    - 3000:3000
+    # Wait for Mimir to be healthy (i.e., the healthcheck container)
+    depends_on:
+      loki:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+      mimir-healthcheck:
+        condition: service_completed_successfully
+    volumes:
+    - ./config/grafana-provisioning/datasources:/etc/grafana/provisioning/datasources
+    - ./volumes/grafana-data:/var/lib/grafana
+    - ./volumes/grafana-logs:/var/log/grafana
