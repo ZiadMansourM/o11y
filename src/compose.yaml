@@ -202,8 +202,8 @@ services:
   # Grafana (UI)
   # -----------------------------------------------------
   grafana:
-    image: grafana/grafana-oss:11.4.0-ubuntu
-    # image: grafana/grafana-oss:12.0.2-ubuntu
+    # image: grafana/grafana-oss:11.4.0-ubuntu
+    image: grafana/grafana-oss:12.0.2-ubuntu
     logging:
       driver: json-file
       options:
