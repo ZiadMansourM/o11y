@@ -1,3 +1,36 @@
+## Quick ToDo
+- [ ] Correlate Metrics to Traces "exemplars".
+- [ ] Add:
+    - Error Rate.
+    - Latency.
+    - Traffic.
+    - Availability.
+
+## ToDo
+- [X] Traces
+- [X] Logs
+- [ ] Metrics
+    - **DONE** Get it to work.
+    - Error Rate.
+    - Latency.
+    - Traffic.
+    + Availability.
+- [ ]Correlate Metrics to Traces.
+    - I want to see the spans that resulted in this metric.
+- [ ] v2 RollDice Service.
+    - OpenFeature.
+
+
+## What Vodafone Assist Needs
+1. Traces Drill Down.
+    - Faster Debugging.
+2. Realtime Usage Reporting / KPIs.
+    - Useful Business Insights.
+3. Enrich Context && Correlate Signals.
+    - No Longer: That is Weird!
+4. Alerting.
+5. Faster Delivery.
+
 ## Current Status
 - We are using prometheus auto instrumentation pkg.
 - Loki stores all logs without any context.
