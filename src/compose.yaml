@@ -224,5 +224,6 @@ services:
         condition: service_completed_successfully
     volumes:
     - ./config/grafana-provisioning/datasources:/etc/grafana/provisioning/datasources
+    - ./config/grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards
     - ./volumes/grafana-data:/var/lib/grafana
     - ./volumes/grafana-logs:/var/log/grafana
