@@ -1,10 +1,15 @@
+## Action Plan
+
 ## Quick ToDo
+- [X] Check Dashboards in Git.
 - [ ] Correlate Metrics to Traces "exemplars".
 - [ ] Add:
     - Error Rate.
     - Latency.
     - Traffic.
     - Availability.
+- [ ] Add Frontend.
+- [ ] Add v2.
 
 ## ToDo
 - [X] Traces
@@ -51,6 +56,7 @@
         - LCP (Largest Contentful Paint).
         - FID (First Input Delay) >>> INP (Interaction to Next Paint).
         - CLS (Cumulative Layout Shift).
+        + Funnel Report.
 - o11y guild
 
 ## Demo
@@ -65,6 +71,7 @@
                     - Error Rate.
                     - Latency.
                     - Traffic.
+                    <!-- - Saturation. -->
                 - **DONE** Tracing.
                 - **DONE** Logging.
         - Different Telemetry Signals in Action "Debugging / Correlation".
