@@ -62,6 +62,7 @@ func rollSingleDice(ctx context.Context, rollNumber int) int {
 		attribute.Int("roll.number", rollNumber),
 	)
 	rollCnt.Add(ctx, 1, metric.WithAttributes(rollValueAttr))
+	// rollCnt.Record(ctx, int64(roll), metric.WithAttributes(rollValueAttr))
 
 	// Log the roll result
 	logger.InfoContext(ctx, "Dice rolled", "roll_number", rollNumber, "result", roll)

@@ -132,6 +132,7 @@ func newMeterProvider(ctx context.Context) (*metric.MeterProvider, error) {
 			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(serviceVersion),
 		)),
+		// metric.WithExemplarFilter(exemplar.TraceBasedFilter),
 	)
 	return meterProvider, nil
 }

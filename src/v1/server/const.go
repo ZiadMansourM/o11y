@@ -20,6 +20,7 @@ var (
 	logger *slog.Logger
 
 	rollCnt metric.Int64Counter
+	// rollCnt metric.Int64Histogram
 
 	requestCounter  metric.Int64Counter
 	requestDuration metric.Float64Histogram

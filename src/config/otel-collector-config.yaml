@@ -194,6 +194,7 @@ service:
       receivers: [otlp, prometheus]
       processors: [batch]
       exporters: [otlphttp/metrics]
+      # exporters: [otlphttp/metrics, debug]
     # metrics/hostmetrics:
     #   receivers: [hostmetrics]
     #   processors: [resource/source-location-attr]

@@ -24,6 +24,10 @@ limits:
   # compactor_blocks_retention_period: 1y
   compactor_blocks_retention_period: 336h
 
+  # ref: https://grafana.com/docs/mimir/latest/manage/use-exemplars/store-exemplars/
+  # max_global_exemplars_per_user: 100000
+
+
 # Blocks storage requires a prefix when using a common object storage bucket.
 blocks_storage:
   storage_prefix: blocks

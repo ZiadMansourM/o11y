@@ -29,6 +29,9 @@ func initializeTelemetry() error {
 	rollCnt, err = meter.Int64Counter("dice.rolls",
 		metric.WithDescription("The number of rolls by roll value"),
 		metric.WithUnit("{roll}"))
+	// rollCnt, err = meter.Int64Histogram("dice.rolls",
+	// 	metric.WithDescription("The frequency distribution of dice roll values"),
+	// 	metric.WithUnit("{roll}"))
 	if err != nil {
 		return err
 	}

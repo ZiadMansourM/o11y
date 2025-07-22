@@ -304,6 +304,7 @@ func newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(serviceVersion),
 		)),
+		// sdkmetric.WithExemplarFilter(exemplar.TraceBasedFilter),
 	)
 	return meterProvider, nil
 }
