@@ -64,6 +64,7 @@ services:
       driver: json-file
       options:
         tag: 'lgtm/mimir'
+    restart: unless-stopped
     command: ["-config.file=/etc/mimir.yaml"]
     hostname: mimir
     # We do NOT define a healthcheck here because the image lacks curl/wget
