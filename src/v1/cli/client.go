@@ -120,15 +120,25 @@ func callDiceServer(ctx context.Context, client *http.Client) {
 	}
 	defer resp.Body.Close()
 
-	// Read and print the response
+	// Read and print the response body first (regardless of status code)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to read response")
 		logger.ErrorContext(ctx, "Failed to read response", "error", err)
 		return
 	}
 
-	logger.InfoContext(ctx, fmt.Sprintf("Response: %s", body))
+	// Log the response with appropriate level based on status code
+	if resp.StatusCode >= 400 {
+		err := fmt.Errorf("server returned error status: %d %s", resp.StatusCode, resp.Status)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Server returned error status")
+		logger.ErrorContext(ctx, fmt.Sprintf("Response: %s", body), "status_code", resp.StatusCode, "status", resp.Status)
+		return
+	} else {
+		logger.InfoContext(ctx, fmt.Sprintf("Response: %s", body), "status_code", resp.StatusCode)
+	}
 }
 
 // Middleware function type
@@ -172,6 +182,23 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 		// Measure request latency
 		elapsedTime := time.Since(start).Seconds()
 		clientLatency.Record(ctx, elapsedTime)
+
+		// Check for HTTP error status codes
+		if resp.StatusCode >= 400 {
+			err := fmt.Errorf("server returned error status: %d %s", resp.StatusCode, resp.Status)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, fmt.Sprintf("Server returned error status: %d", resp.StatusCode))
+			clientErrorCount.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("error.type", "http_error"),
+				attribute.Int("http.status_code", resp.StatusCode),
+			))
+			logger.ErrorContext(ctx, "Received HTTP response",
+				"status_code", resp.StatusCode,
+				"status", resp.Status,
+				"elapsed_time", elapsedTime,
+			)
+			return resp, nil // Return the response so caller can handle the error status
+		}
 
 		logger.InfoContext(ctx, "Received HTTP response",
 			"status", resp.StatusCode,

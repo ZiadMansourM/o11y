@@ -13,6 +13,7 @@ import (
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -46,6 +47,9 @@ func initializeTelemetry() error {
 	requestDuration, err = meter.Float64Histogram("http_request_duration_seconds",
 		metric.WithDescription("Duration of HTTP requests in seconds"),
 		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(
+			0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5,
+		),
 	)
 	if err != nil {
 		return err
@@ -182,15 +186,14 @@ func instrumentationMiddleware(next http.Handler) http.Handler {
 		ctx, span := tracer.Start(ctx, fmt.Sprintf("HTTP %s %s", r.Method, r.URL.Path))
 		defer span.End()
 
-		// Track request count and size
-		requestCounter.Add(ctx, 1)
+		// Track request size
 		requestSize.Record(ctx, r.ContentLength)
 
 		// Logging before request processing
 		logger.InfoContext(ctx, "Got new HTTP request", "method", r.Method, "path", r.URL.Path)
 
-		// Wrap response writer to capture response size
-		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		// Wrap response writer to capture response size and status code
+		rec := &responseRecorder{ResponseWriter: w, statusCode: 0}
 		r = r.WithContext(ctx)
 		next.ServeHTTP(rec, r)
 
@@ -198,6 +201,13 @@ func instrumentationMiddleware(next http.Handler) http.Handler {
 		responseSize.Record(ctx, int64(rec.bytesWritten))
 		elapsedTime := time.Since(start).Seconds()
 		requestDuration.Record(ctx, elapsedTime)
+
+		// Track final request with status code for complete traffic metrics
+		requestCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("method", r.Method),
+			attribute.String("route", r.URL.Path),
+			attribute.Int("status_code", rec.statusCode),
+		))
 
 		// Logging after request processing
 		logger.InfoContext(ctx, "Sending HTTP response", "status", rec.statusCode, "elapsed_time", elapsedTime)
@@ -217,6 +227,10 @@ func (r *responseRecorder) WriteHeader(code int) {
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
+	// If no status code was set explicitly, it defaults to 200
+	if r.statusCode == 0 {
+		r.statusCode = http.StatusOK
+	}
 	size, err := r.ResponseWriter.Write(b)
 	r.bytesWritten += size
 	return size, err

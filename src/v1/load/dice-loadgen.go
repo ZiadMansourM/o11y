@@ -1,19 +1,17 @@
-package main
-
+// # Pure Poisson around 50 rps, 2 minutes
 // go run dice-loadgen.go -c 20 -r 50 -d 2m
-// With -c 20 -r 50 for two minutes you’ll push ~6000 requests:
-//   20 workers, each firing 50 requests per second
-// total = duration * rate  = 120s * 50 rps  ≈ 6000 requests
-//    each worker fires ≈ 3 rps (50 / 20)
-// The Traffic panel (PromQL: sum(rate(http_requests_total[1m])))
-// should stabilise around 50 req/s, the latency histogram will show
-// p95, and any 5xx responses will tick up your error panel.
+
+// # Same but add ±20 % jitter
+// go run dice-loadgen.go -c 20 -r 50 -v 0.2 -d 2m
+// Traffic panel (PromQL: sum(rate(http_requests_total[1m]))) ≈ 50 rps
+package main
 
 import (
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -42,19 +40,23 @@ import (
 // -----------------------------------------------------------------------------
 const (
 	serviceName      = "dice-loadgen"
-	serviceVersion   = "v1.0.0"
+	serviceVersion   = "v1.0.1"
 	otelCollectorURL = "localhost:4318"
 	targetDefaultURL = "http://127.0.0.1:3030/rolldice/"
 )
 
 var (
-	// Flags
+	// Simulation parameters
+	variability = flag.Float64("v", 0.0,
+		"relative jitter (e.g. 0.2 = ±20%) around target RPS; 0 = pure Poisson")
+
+	// CLI flags
 	concurrency = flag.Int("c", 10, "parallel workers")
 	reqRate     = flag.Int("r", 20, "requests per second (total)")
-	duration    = flag.Duration("d", 60*time.Second, "test duration")
+	duration    = flag.Duration("d", 60*time.Second, "test duration (0 = until CTRL-C)")
 	endpoint    = flag.String("u", targetDefaultURL, "target URL")
 
-	// OTel globals (re‑using names from your dice‑cli file so import‑cycle‑free)
+	// OpenTelemetry globals
 	name   = "github.com/ZiadMansour/bastet/o11y/dice-loadgen"
 	meter  = otel.Meter(name)
 	tracer = otel.Tracer(name)
@@ -66,90 +68,109 @@ var (
 )
 
 // -----------------------------------------------------------------------------
-// Instrumentation setup (copied from your dice‑cli, minimal tweaks)
+// Instrumentation setup (copied from dice‑cli; minimal tweaks)
 // -----------------------------------------------------------------------------
 func init() {
 	var err error
 
-	clientReqCounter, err = meter.Int64Counter(
-		"client_requests_total",
-		metric.WithDescription("Total number of outgoing HTTP requests"),
-	)
+	clientReqCounter, err = meter.Int64Counter("client_requests_total",
+		metric.WithDescription("Total number of outgoing HTTP requests"))
 	must(err)
 
-	clientLatency, err = meter.Float64Histogram(
-		"client_request_latency_seconds",
-		metric.WithDescription("Latency of outgoing HTTP requests"),
-		metric.WithUnit("s"),
-	)
+	clientLatency, err = meter.Float64Histogram("client_request_latency_seconds",
+		metric.WithDescription("Latency of outgoing HTTP requests in seconds"),
+		metric.WithUnit("s"))
 	must(err)
 
-	clientErrCounter, err = meter.Int64Counter(
-		"client_request_errors_total",
-		metric.WithDescription("Total number of failed outgoing HTTP requests"),
-	)
+	clientErrCounter, err = meter.Int64Counter("client_request_errors_total",
+		metric.WithDescription("Total number of failed outgoing HTTP requests"))
 	must(err)
 }
 
 func main() {
 	flag.Parse()
 
-	// Ctrl‑C handling
+	// ── Graceful shutdown boilerplate ──────────────────────────────────────────
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	// OpenTelemetry boot‑strap
 	shutdown, err := setupOTelSDK(rootCtx)
 	must(err)
 	defer shutdown(context.Background()) // nolint:errcheck
 
-	// HTTP client with OTel middleware
-	client := http.Client{
+	httpClient := http.Client{
 		Transport: ApplyMiddleware(http.DefaultTransport, clientInstrumentationMiddleware),
 	}
 
-	// -------------------------------------------------------------------------
-	// Load‑generation loop
-	// -------------------------------------------------------------------------
+	// ── Load generator parameters ─────────────────────────────────────────────
 	fmt.Printf("Starting load: %d workers, %d req/s total, %s duration → %s\n",
 		*concurrency, *reqRate, duration.String(), *endpoint)
 
-	var wg sync.WaitGroup
 	perReq := time.Second / time.Duration(*reqRate)
 	ticker := time.NewTicker(perReq)
 	defer ticker.Stop()
 
-	stopAfter := time.After(*duration)
+	stopCh := make(chan struct{})
+	var once sync.Once
+	closeStop := func() { once.Do(func() { close(stopCh) }) }
 
+	if *duration > 0 {
+		go func() {
+			time.Sleep(*duration)
+			closeStop()
+		}()
+	}
+	go func() {
+		<-rootCtx.Done()
+		closeStop()
+	}()
+
+	// ── Worker pool ───────────────────────────────────────────────────────────
+	var wg sync.WaitGroup
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
 				select {
-				case <-stopAfter:
+				case <-stopCh:
 					return
-				case <-ticker.C:
-					callDiceServer(rootCtx, &client)
+				default:
+					callDiceServer(rootCtx, &httpClient)
+					time.Sleep(nextInterval(*reqRate))
 				}
 			}
 		}()
 	}
 
 	wg.Wait()
-	fmt.Println("Load test finished.  Shutting down …")
+	fmt.Println("Load test finished — shutting down.")
 }
 
 // -----------------------------------------------------------------------------
-// --- Re‑used helpers (middleware, OTel SDK boot‑strap, etc.) ------------------
+// Helpers (middleware, OTel setup, etc.)
 // -----------------------------------------------------------------------------
+
+// nextInterval returns how long to sleep before the next request
+func nextInterval(baseRPS int) time.Duration {
+	// 1) Poisson: exponential with mean = 1/R
+	lambda := float64(baseRPS)
+	dt := rand.ExpFloat64() / lambda // seconds
+
+	// 2) Optional ± jitter% around the sample
+	if *variability > 0 {
+		jitter := 1 + (*variability)*(rand.Float64()*2-1) // 1 ± v
+		dt *= jitter
+	}
+	return time.Duration(dt * float64(time.Second))
+}
 
 // callDiceServer performs one HTTP GET and records span/metrics/log.
 func callDiceServer(ctx context.Context, client *http.Client) {
 	ctx, span := tracer.Start(ctx, "CallDiceServer")
 	defer span.End()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", *endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, *endpoint, nil)
 	if err != nil {
 		span.RecordError(err)
 		logger.ErrorContext(ctx, "failed to create request", "error", err)
@@ -167,8 +188,7 @@ func callDiceServer(ctx context.Context, client *http.Client) {
 	resp.Body.Close()
 }
 
-// --- HTTP client middleware ---------------------------------------------------
-
+// ── HTTP client middleware ───────────────────────────────────────────────────
 type clientMW func(http.RoundTripper) http.RoundTripper
 
 func ApplyMiddleware(rt http.RoundTripper, mws ...clientMW) http.RoundTripper {
@@ -185,7 +205,6 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 		defer span.End()
 
 		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
-
 		clientReqCounter.Add(ctx, 1)
 
 		resp, err := next.RoundTrip(req)
@@ -196,9 +215,7 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 			return nil, err
 		}
 
-		elapsed := time.Since(start).Seconds()
-		clientLatency.Record(ctx, elapsed)
-
+		clientLatency.Record(ctx, time.Since(start).Seconds())
 		return resp, nil
 	})
 }
@@ -209,43 +226,39 @@ func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
 
-// --- OpenTelemetry pipeline ---------------------------------------------------
-
+// ── OpenTelemetry pipeline ───────────────────────────────────────────────────
 func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
-	var cleanups []func(context.Context) error
-	add := func(fn func(context.Context) error) { cleanups = append(cleanups, fn) }
-
-	// composite shutdown func
-	shutdown := func(ctx context.Context) error {
+	var cbs []func(context.Context) error
+	add := func(fn func(context.Context) error) { cbs = append(cbs, fn) }
+	cleanup := func(ctx context.Context) error {
 		var err error
-		for _, fn := range cleanups {
+		for _, fn := range cbs {
 			err = errors.Join(err, fn(ctx))
 		}
 		return err
 	}
 
-	prop := propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	)
-	otel.SetTextMapPropagator(prop)
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		))
 
-	// --- Traces
-	traceExp, err := otlptracehttp.New(ctx,
+	// Traces
+	tExp, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(otelCollectorURL),
 		otlptracehttp.WithInsecure())
 	if err != nil {
 		return nil, err
 	}
 	tp := trace.NewTracerProvider(
-		trace.WithBatcher(traceExp, trace.WithBatchTimeout(time.Second)),
-		trace.WithResource(resAttrs()),
-	)
+		trace.WithBatcher(tExp, trace.WithBatchTimeout(time.Second)),
+		trace.WithResource(resAttrs()))
 	add(tp.Shutdown)
 	otel.SetTracerProvider(tp)
 
-	// --- Metrics
-	metricExp, err := otlpmetrichttp.New(ctx,
+	// Metrics
+	mExp, err := otlpmetrichttp.New(ctx,
 		otlpmetrichttp.WithEndpoint(otelCollectorURL),
 		otlpmetrichttp.WithInsecure())
 	if err != nil {
@@ -253,27 +266,24 @@ func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
 	}
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(
-			sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(3*time.Second))),
-		sdkmetric.WithResource(resAttrs()),
-	)
+			sdkmetric.NewPeriodicReader(mExp, sdkmetric.WithInterval(3*time.Second))),
+		sdkmetric.WithResource(resAttrs()))
 	add(mp.Shutdown)
 	otel.SetMeterProvider(mp)
 
-	// --- Logs (optional)
-	logExp, err := otlploghttp.New(ctx,
+	// Logs (optional)
+	lExp, err := otlploghttp.New(ctx,
 		otlploghttp.WithEndpoint(otelCollectorURL),
 		otlploghttp.WithInsecure())
-	if err != nil {
-		return nil, err
+	if err == nil { // logs are best‑effort
+		lp := log.NewLoggerProvider(
+			log.WithProcessor(log.NewBatchProcessor(lExp)),
+			log.WithResource(resAttrs()))
+		add(lp.Shutdown)
+		global.SetLoggerProvider(lp)
 	}
-	lp := log.NewLoggerProvider(
-		log.WithProcessor(log.NewBatchProcessor(logExp)),
-		log.WithResource(resAttrs()),
-	)
-	add(lp.Shutdown)
-	global.SetLoggerProvider(lp)
 
-	return shutdown, nil
+	return cleanup, nil
 }
 
 func resAttrs() *resource.Resource {
@@ -284,8 +294,7 @@ func resAttrs() *resource.Resource {
 	)
 }
 
-// --- tiny helper --------------------------------------------------------------
-
+// tiny panic‑on‑error helper
 func must(err error) {
 	if err != nil {
 		panic(err)
