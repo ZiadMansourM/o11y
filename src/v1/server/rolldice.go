@@ -51,7 +51,7 @@ func rolldice(w http.ResponseWriter, r *http.Request) {
 
 	// Set status code based on whether any errors occurred
 	if hasError {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusUnprocessableEntity) // 422 for business logic failure
 		span.SetStatus(codes.Error, "One or more dice rolls had errors")
 	} else {
 		span.SetStatus(codes.Ok, "Roll dice handler completed successfully")

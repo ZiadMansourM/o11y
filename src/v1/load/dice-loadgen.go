@@ -40,7 +40,7 @@ import (
 // -----------------------------------------------------------------------------
 const (
 	serviceName      = "dice-loadgen"
-	serviceVersion   = "v1.0.1"
+	serviceVersion   = "v1.0.0"
 	otelCollectorURL = "localhost:4318"
 	targetDefaultURL = "http://127.0.0.1:3030/rolldice/"
 )
@@ -64,7 +64,6 @@ var (
 
 	clientReqCounter metric.Int64Counter
 	clientLatency    metric.Float64Histogram
-	clientErrCounter metric.Int64Counter
 )
 
 // -----------------------------------------------------------------------------
@@ -80,10 +79,6 @@ func init() {
 	clientLatency, err = meter.Float64Histogram("client_request_latency_seconds",
 		metric.WithDescription("Latency of outgoing HTTP requests in seconds"),
 		metric.WithUnit("s"))
-	must(err)
-
-	clientErrCounter, err = meter.Int64Counter("client_request_errors_total",
-		metric.WithDescription("Total number of failed outgoing HTTP requests"))
 	must(err)
 }
 
@@ -181,7 +176,6 @@ func callDiceServer(ctx context.Context, client *http.Client) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "request failed")
-		clientErrCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
 		logger.ErrorContext(ctx, "request failed", "error", err)
 		return
 	}
@@ -205,17 +199,32 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 		defer span.End()
 
 		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
-		clientReqCounter.Add(ctx, 1)
 
 		resp, err := next.RoundTrip(req)
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "HTTP request failed")
-			clientErrCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
+
+			// Record request with error attributes
+			clientReqCounter.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("method", req.Method),
+				attribute.String("url", req.URL.Path),
+				attribute.String("error.type", err.Error()),
+				attribute.String("status", "error"),
+			))
+
 			return nil, err
 		}
 
 		clientLatency.Record(ctx, time.Since(start).Seconds())
+
+		// Record request with status code
+		clientReqCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("method", req.Method),
+			attribute.String("url", req.URL.Path),
+			attribute.Int("status_code", resp.StatusCode),
+		))
+
 		return resp, nil
 	})
 }

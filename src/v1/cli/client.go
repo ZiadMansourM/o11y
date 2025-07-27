@@ -41,7 +41,6 @@ var (
 
 	clientReqCounter metric.Int64Counter
 	clientLatency    metric.Float64Histogram
-	clientErrorCount metric.Int64Counter
 )
 
 func init() {
@@ -57,13 +56,6 @@ func init() {
 	clientLatency, err = meter.Float64Histogram("client_request_latency_seconds",
 		metric.WithDescription("Latency of outgoing HTTP requests in seconds"),
 		metric.WithUnit("s"),
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	clientErrorCount, err = meter.Int64Counter("client_request_errors_total",
-		metric.WithDescription("Total number of failed outgoing HTTP requests"),
 	)
 	if err != nil {
 		panic(err)
@@ -162,9 +154,6 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 		// Inject the current trace context into the outgoing request headers.
 		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
-		// Increment request count
-		clientReqCounter.Add(ctx, 1)
-
 		logger.InfoContext(ctx, "Sending HTTP request",
 			"method", req.Method,
 			"url", req.URL.String(),
@@ -174,7 +163,15 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "HTTP request failed")
-			clientErrorCount.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
+
+			// Record request with error attributes
+			clientReqCounter.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("method", req.Method),
+				attribute.String("url", req.URL.Path),
+				attribute.String("error.type", err.Error()),
+				attribute.String("status", "error"),
+			))
+
 			logger.ErrorContext(ctx, "HTTP request failed", "error", err)
 			return nil, err
 		}
@@ -183,15 +180,19 @@ func clientInstrumentationMiddleware(next http.RoundTripper) http.RoundTripper {
 		elapsedTime := time.Since(start).Seconds()
 		clientLatency.Record(ctx, elapsedTime)
 
+		// Record request with status code (similar to server pattern)
+		clientReqCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("method", req.Method),
+			attribute.String("url", req.URL.Path),
+			attribute.Int("status_code", resp.StatusCode),
+		))
+
 		// Check for HTTP error status codes
 		if resp.StatusCode >= 400 {
 			err := fmt.Errorf("server returned error status: %d %s", resp.StatusCode, resp.Status)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, fmt.Sprintf("Server returned error status: %d", resp.StatusCode))
-			clientErrorCount.Add(ctx, 1, metric.WithAttributes(
-				attribute.String("error.type", "http_error"),
-				attribute.Int("http.status_code", resp.StatusCode),
-			))
+
 			logger.ErrorContext(ctx, "Received HTTP response",
 				"status_code", resp.StatusCode,
 				"status", resp.Status,
